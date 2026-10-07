@@ -1,9 +1,26 @@
-import gradio as gr
+# ================================
+# Import environment
+# (Dependencies were installed)
+# ================================
+
+# Standard library
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import List, Tuple, Dict, Any
-from langchain_openai import ChatOpenAI
+
+# Third-party
+import gradio as gr
+import numpy as np
+import torch
+from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from sentence_transformers import SentenceTransformer
+from transformers import CLIPModel, CLIPProcessor
+
+print("✅ Environment ready")
 
 # Configure OpenAI API
 # os.environ["OPENAI_API_KEY"] = "your-api-key-here"
@@ -101,6 +118,194 @@ Respond with ONLY valid JSON."""
 
 print("Preference extraction function created!")
 
+# ================================
+# Verify vector database
+# ================================
+
+DB_DIR = str((Path.home() / "chroma_multimodal").resolve())
+
+if not os.path.isdir(DB_DIR):
+    raise RuntimeError(
+        f"Vector database directory not found: '{DB_DIR}'. "
+        "Please run build_index.py (Multimodal Vector Index Construction) first."
+    )
+
+article_db = Chroma(collection_name="restaurant_articles", persist_directory=DB_DIR)
+image_db   = Chroma(collection_name="food_images",          persist_directory=DB_DIR)
+
+n_articles = article_db._collection.count()
+n_images   = image_db._collection.count()
+
+if n_articles <= 0 or n_images <= 0:
+    raise RuntimeError(
+        "One or more collections are empty. Please rerun build_index.py to rebuild the index."
+    )
+
+print(f"✅ Article vectors: {n_articles}")
+print(f"✅ Image vectors:   {n_images}")
+
+# ================================
+# Initialize embedding models
+# ================================
+
+# ---- Text embedding model (384-d) ----
+text_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def embed_texts(texts, batch_size=64):
+    return text_model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=False,
+        normalize_embeddings=True,  # cosine-ready
+    ).astype(np.float32)
+
+print("✅ Text embedder ready")
+
+
+# ---- CLIP embedding model (512-d) for image + query text ----
+device = "cpu"
+clip_name = "openai/clip-vit-base-patch32"
+clip_model = CLIPModel.from_pretrained(clip_name).to(device)
+clip_processor = CLIPProcessor.from_pretrained(clip_name, use_fast=True)
+clip_model.eval()
+
+@torch.no_grad()
+def embed_query_clip_text(query: str):
+    inputs = clip_processor(text=[query], return_tensors="pt", padding=True).to(device)
+    feats = clip_model.get_text_features(**inputs)              # (1,512)
+    feats = feats.pooler_output
+    feats = feats / feats.norm(dim=-1, keepdim=True)            # cosine-ready
+    return feats[0].cpu().numpy().astype(np.float32)
+
+print("✅ CLIP embedder ready")
+
+# ================================
+# Utilities
+# ================================
+
+def _unwrap(res: dict):
+    """Chroma returns lists-of-lists; unwrap the first query."""
+    ids   = res.get("ids", [[]])[0]
+    docs  = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0]
+    return ids, docs, metas, dists
+
+def _to_similarity(dists):
+    """Convert 'smaller is better' distance to 'larger is better' similarity."""
+    d = np.array(dists, dtype=np.float32)
+    return 1.0 - d
+
+def _minmax(x):
+    """Min-max normalize to [0, 1] with safe handling for constant arrays."""
+    x = np.array(x, dtype=np.float32)
+    if x.size == 0:
+        return x
+    lo, hi = float(x.min()), float(x.max())
+    if abs(hi - lo) < 1e-8:
+        return np.ones_like(x)  # all equal -> treat as same confidence
+    return (x - lo) / (hi - lo)
+
+# ================================
+# Retrieval functions
+# ================================
+
+def retrieve_articles(query: str, k: int = 5, where: dict | None = None):
+    q_vec = embed_texts([query])[0]  # 384-d
+    res = article_db._collection.query(
+        query_embeddings=[q_vec.tolist()],
+        n_results=k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+    ids, docs, metas, dists = _unwrap(res)
+    sims = _to_similarity(dists)
+    return ids, docs, metas, sims
+
+def retrieve_images_by_text(query: str, k: int = 5, where: dict | None = None):
+    q_vec = embed_query_clip_text(query)  # 512-d
+    res = image_db._collection.query(
+        query_embeddings=[q_vec.tolist()],
+        n_results=k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+    ids, docs, metas, dists = _unwrap(res)
+    sims = _to_similarity(dists)
+    return ids, docs, metas, sims
+
+print("✅ Retrieval functions ready")
+
+# ================================
+# Multimodal fusion
+# ================================
+
+def fuse_rank(
+    query: str,
+    k_text: int = 5,
+    k_img: int = 5,
+    w_text: float = 0.6,
+    w_img: float = 0.4,
+    where_text: dict | None = None,
+    where_img: dict | None = None,
+    top_n: int = 5
+):
+    # Retrieve per modality
+    t_ids, t_docs, t_metas, t_sims = retrieve_articles(query, k=k_text, where=where_text)
+    i_ids, i_docs, i_metas, i_sims = retrieve_images_by_text(query, k=k_img, where=where_img)
+
+    # Normalize within modality
+    t_norm = _minmax(t_sims)
+    i_norm = _minmax(i_sims)
+
+    # Build one mixed candidate list with fused scores
+    rows = []
+    for j in range(len(t_ids)):
+        rows.append({
+            "modality": "article",
+            "name": t_metas[j].get("name", "N/A") if isinstance(t_metas[j], dict) else "N/A",
+            "cuisine": t_metas[j].get("cuisine", "N/A") if isinstance(t_metas[j], dict) else "N/A",
+            "price": t_metas[j].get("price_range", "N/A") if isinstance(t_metas[j], dict) else "N/A",
+            "rating": t_metas[j].get("rating", "N/A") if isinstance(t_metas[j], dict) else "N/A",
+            "description": t_metas[j].get("environment", "N/A") if isinstance(t_metas[j], dict) else "N/A",
+            "text_score": float(t_norm[j]),
+            "img_score": 0.0,
+            "fused": float(w_text * t_norm[j]),
+        })
+
+    for j in range(len(i_ids)):
+        rows.append({
+            "modality": "image",
+            "name": i_metas[j].get("name", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "cuisine": i_metas[j].get("cuisine", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "servings": i_metas[j].get("servings", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "prep_time": i_metas[j].get("prep_time", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "cook_time": i_metas[j].get("cook_time", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "description": i_metas[j].get("image_description", "N/A") if isinstance(i_metas[j], dict) else "N/A",
+            "text_score": 0.0,
+            "img_score": float(i_norm[j]),
+            "fused": float(w_img * i_norm[j]),
+        })
+
+    # Sort by fused score (desc rerank)
+    rows.sort(key=lambda r: r["fused"], reverse=True)
+    
+    # if top_n not specified, return full pool (k_text + k_img)
+    if top_n is None:
+        return rows
+
+    top_n = max(0, min(int(top_n), len(rows)))
+    return rows[:top_n]
+
+def print_fused(rows, title: str, max_chars: int = 90):
+    print(f"\n=== {title} ===")
+    for idx, r in enumerate(rows, start=1):
+        print(
+            f"[{idx}] {r['modality']} | cuisine={r['cuisine']} | "
+            f"fused={r['fused']:.4f} "
+            f"(text={r['text_score']:.4f}, img={r['img_score']:.4f})"
+        )
+
 # Agent configurations
 agent_configs = {
     "user_profile_generator": {
@@ -112,16 +317,6 @@ agent_configs = {
         and building rich user profiles that capture both explicit and implicit food preferences. You understand that a user's 
         social media posts and check-ins tell a story about their culinary journey, and you're skilled at extracting meaningful 
         insights from unstructured data."""
-    },
-    "rag_retriever": {
-        "role": "RAG Retriever",
-        "goal": "Query multimodal vector databases to retrieve relevant restaurants, recipes, and food-related content based on user profiles and similarity search.",
-        "backstory": """You are a data retrieval specialist with expertise in vector databases and semantic search. 
-        You understand how embeddings capture meaning and can craft queries that retrieve the most relevant information 
-        from large collections of restaurant data, recipes, and food images. You know when to use similarity search versus 
-        filtered search, and you can balance relevance with diversity to ensure recommendations aren't repetitive. 
-        You've worked with Pinecone, Weaviate, and ChromaDB, and you understand the nuances of multimodal retrieval 
-        where text and images work together to represent food experiences."""
     },
     "food_trend_analyst": {
         "role": "Food Trend Analyst",
@@ -218,6 +413,8 @@ Provide output in JSON format with these keys:
 - price_range (string)
 - adventurousness_score (1-10)
 - flavor_preferences (list)
+- servings (int 2/3/4/6/8)
+- rating (float 3.8-5.0)
 - summary (string)
 """
     
@@ -238,24 +435,36 @@ def node_retrieve_candidates(state: dict) -> dict:
     print("\n[Phase 2] Retrieving candidates from vector database...")
     
     profile = state["user_profile"]
-    
-    user_message = f"""Based on this user profile:
-{json.dumps(profile, indent=2)}
 
-Simulate retrieving top 20 restaurants and top 20 recipes from a vector database.
+    # ================================
+    # Multimodal fusion (metadata filters)
+    # ================================
 
-Return JSON with two arrays:
-- restaurants: [{{"name": str, "cuisine": str, "price": str, "rating": float, "description": str}}]
-- recipes: [{{"name": str, "cuisine": str, "difficulty": str, "prep_time": str, "description": str}}]
+    q = " ".join(profile.get("favorite_cuisines", []) + profile.get("dietary_restrictions", []) + profile.get("dining_occasions", []) + profile.get("flavor_preferences", []))
 
-Make the results realistic and diverse.
-"""
-    
+    where_articles = {"rating": {"$gte": profile.get("rating", [])}} if profile.get("rating", []) else None   # change to any rating present in your dataset
+    where_images   = {"servings": profile.get("servings", [])} if profile.get("servings", []) else None       # optional
+
     try:
-        response = call_agent("rag_retriever", user_message)
-        retrieved_data = json.loads(response)
-        restaurants = retrieved_data.get("restaurants", [])
-        recipes = retrieved_data.get("recipes", [])
+        rows = fuse_rank(
+            q,
+            k_text=40,
+            k_img=40,
+            w_text=0.6,
+            w_img=0.4,
+            where_text=where_articles,
+            where_img=where_images,
+            top_n=40
+        )
+
+        if len(rows) == 0:
+            print("⚠️ No results found. Try relaxing filters (cuisine).")
+        else:
+            print_fused(rows, title="Multimodal fusion (metadata filters)")
+
+        print("🎉 Multimodal Similarity Fusion and Retrieval Ranking COMPLETE")
+        restaurants = [r for r in rows if r["modality"] == "article"]
+        recipes = [r for r in rows if r["modality"] == "image"]
         print(f"✓ Retrieved {len(restaurants)} restaurants and {len(recipes)} recipes")
     except Exception as e:
         print(f"⚠ Error retrieving candidates: {e}")
@@ -367,7 +576,7 @@ Nutrition: {json.dumps(state['nutrition_analysis'], indent=2)}
 Return JSON:
 {{
   "restaurants": [{{"name": str, "cuisine": str, "price": str, "reasoning": str}}],
-  "recipes": [{{"name": str, "cuisine": str, "difficulty": str, "reasoning": str}}]
+  "recipes": [{{"name": str, "cuisine": str, "cook_time": str, "reasoning": str}}]
 }}
 
 Each reasoning should be 2-3 sentences explaining why it's a great match.
@@ -505,7 +714,7 @@ def format_recommendations(recommendations: Dict[str, Any]) -> str:
         for i, recipe in enumerate(recommendations["recipes"], 1):
             output += f"**{i}. {recipe['name']}**\n"
             output += f"   - Cuisine: {recipe['cuisine']}\n"
-            output += f"   - Difficulty: {recipe['difficulty']}\n"
+            output += f"   - Cook time: {recipe['cook_time']}\n"
             output += f"   - Why: {recipe['reasoning']}\n\n"
     
     if not output:
