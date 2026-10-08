@@ -15,6 +15,7 @@ import gradio as gr
 import numpy as np
 import torch
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sentence_transformers import SentenceTransformer
@@ -772,10 +773,56 @@ Is there anything else I can help you with?"""
 
 print("Complete chatbot function created!")
 
-def add_restaurant(name: str, cuisine: str, price: str, location: str, description: str) -> str:
+def add_restaurant(name: str, cuisine: str, price: str, rating: float, location: str, description: str) -> str:
     """Add a new restaurant to the database."""
-    # In a real implementation, this would add to the vector database
     print(f"Adding restaurant: {name}")
+    # ================================
+    # Build article document
+    # ================================
+
+    if not name:
+        return
+
+    name = name.strip()
+
+    text = (
+        f"Restaurant: {name}\n"
+        f"Cuisine: {cuisine}\n"
+        f"Location: {location}"
+    )
+
+    i = article_db._collection.count()
+
+    # GUARANTEED UNIQUE
+    doc_id = f"rest_{i}"
+
+    article_doc = Document(
+        page_content=text.strip(),
+        metadata={
+            "doc_id": doc_id,
+            "name": name,
+            "cuisine": cuisine,
+            "location": location,
+            "price_range": price,
+            "rating": rating,
+            "environment": description,
+            "source": "restaurant",
+        },
+    )
+
+    # ================================
+    # Construct and Persist Vector Index
+    # ================================
+
+    # ----- article DB -----
+    A = embed_texts([article_doc.page_content])
+
+    article_db._collection.upsert(
+        ids=[article_doc.metadata["doc_id"]],
+        embeddings=A.tolist(),
+        documents=[article_doc.page_content],
+        metadatas=[article_doc.metadata],
+    )
     return f"✅ Successfully added '{name}' to the database!"
 
 def add_recipe(name: str, cuisine: str, difficulty: str, prep_time: str, ingredients: str, instructions: str) -> str:
@@ -823,6 +870,10 @@ with gr.Blocks(title="Food Recommendation Chatbot", theme=gr.themes.Soft()) as d
                         choices=["$", "$$", "$$$", "$$$$"],
                         label="Price Range"
                     )
+                    rest_rating = gr.Slider(
+                        minimum=1.0, maximum=5.0, value=4.5, step=0.1,
+                        label="Rating"
+                    )
                 with gr.Column():
                     rest_location = gr.Textbox(label="Location")
                     rest_description = gr.Textbox(
@@ -835,7 +886,7 @@ with gr.Blocks(title="Food Recommendation Chatbot", theme=gr.themes.Soft()) as d
             
             add_rest_btn.click(
                 fn=add_restaurant,
-                inputs=[rest_name, rest_cuisine, rest_price, rest_location, rest_description],
+                inputs=[rest_name, rest_cuisine, rest_price, rest_rating, rest_location, rest_description],
                 outputs=rest_output
             )
         
