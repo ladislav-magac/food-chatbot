@@ -6,6 +6,7 @@
 # Standard library
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
@@ -18,6 +19,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from PIL import Image
 from sentence_transformers import SentenceTransformer
 from transformers import CLIPModel, CLIPProcessor
 
@@ -171,6 +173,19 @@ clip_processor = CLIPProcessor.from_pretrained(clip_name, use_fast=True)
 clip_model.eval()
 
 @torch.no_grad()
+def embed_images(paths, batch_size=16):
+    vecs = []
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i+batch_size]
+        imgs = [Image.open(p).convert("RGB") for p in batch]
+        inputs = clip_processor(images=imgs, return_tensors="pt").to(device)
+        feats = clip_model.get_image_features(**inputs)          # (B,512)
+        feats = feats.pooler_output
+        feats = feats / feats.norm(dim=-1, keepdim=True)         # cosine-ready
+        vecs.append(feats.cpu().numpy().astype(np.float32))
+    return np.vstack(vecs)
+
+@torch.no_grad()
 def embed_query_clip_text(query: str):
     inputs = clip_processor(text=[query], return_tensors="pt", padding=True).to(device)
     feats = clip_model.get_text_features(**inputs)              # (1,512)
@@ -178,7 +193,7 @@ def embed_query_clip_text(query: str):
     feats = feats / feats.norm(dim=-1, keepdim=True)            # cosine-ready
     return feats[0].cpu().numpy().astype(np.float32)
 
-print("✅ CLIP embedder ready")
+print("✅ CLIP embedders ready")
 
 # ================================
 # Utilities
@@ -810,10 +825,6 @@ def add_restaurant(name: str, cuisine: str, price: str, rating: float, location:
         },
     )
 
-    # ================================
-    # Construct and Persist Vector Index
-    # ================================
-
     # ----- article DB -----
     A = embed_texts([article_doc.page_content])
 
@@ -825,10 +836,43 @@ def add_restaurant(name: str, cuisine: str, price: str, rating: float, location:
     )
     return f"✅ Successfully added '{name}' to the database!"
 
-def add_recipe(name: str, cuisine: str, difficulty: str, prep_time: str, ingredients: str, instructions: str) -> str:
+def add_recipe(name: str, cuisine: str, difficulty: str, servings: int, prep_time: str, cook_time: str, ingredients: str, src: str, instructions: str) -> str:
     """Add a new recipe to the database."""
-    # In a real implementation, this would add to the vector database
     print(f"Adding recipe: {name}")
+    i = image_db._collection.count() + 1
+    image_path = str((Path.home() / "food-chatbot-data" / "recipe_images" / "added_recipe_images" / f"recipe{i}.png").resolve())
+    shutil.copy(src, image_path)
+
+    # -------- image --------
+    doc_id = f"img_{i}"
+    
+    image_doc = Document(
+        # keeps retrieval results readable
+        page_content=name,
+        metadata={
+            "doc_id": doc_id,
+            "image_path": image_path,
+            "source": "recipe_image",
+            "recipe_id": i,
+            "name": name,
+            "cuisine": cuisine,
+            "servings": servings,
+            "prep_time": prep_time,
+            "cook_time": cook_time,
+            "image_description": difficulty + " -> " + ingredients + " -> " + instructions,
+        },
+    )
+
+    # ----- image DB -----
+    V = embed_images([image_doc.metadata["image_path"]])
+
+    image_db._collection.upsert(
+        ids=[image_doc.metadata["doc_id"]],
+        embeddings=V.tolist(),
+        documents=[image_doc.page_content],
+        metadatas=[image_doc.metadata],
+    )
+
     return f"✅ Successfully added '{name}' recipe to the database!"
 
 print("Database management functions created!")
@@ -902,13 +946,17 @@ with gr.Blocks(title="Food Recommendation Chatbot", theme=gr.themes.Soft()) as d
                         choices=["Easy", "Medium", "Hard"],
                         label="Difficulty"
                     )
+                    recipe_servings = gr.Number(label="Servings")
                 with gr.Column():
                     recipe_time = gr.Textbox(label="Prep Time")
+                    recipe_cook_time = gr.Textbox(label="Cook Time")
                     recipe_ingredients = gr.Textbox(
                         label="Ingredients (comma-separated)",
                         lines=3
                     )
-            
+                with gr.Column():
+                    recipe_path = gr.Image(type="filepath", label="Food Image")
+
             recipe_instructions = gr.Textbox(
                 label="Instructions",
                 lines=5
@@ -919,7 +967,7 @@ with gr.Blocks(title="Food Recommendation Chatbot", theme=gr.themes.Soft()) as d
             
             add_recipe_btn.click(
                 fn=add_recipe,
-                inputs=[recipe_name, recipe_cuisine, recipe_difficulty, recipe_time, recipe_ingredients, recipe_instructions],
+                inputs=[recipe_name, recipe_cuisine, recipe_difficulty, recipe_servings, recipe_time, recipe_cook_time, recipe_ingredients, recipe_path, recipe_instructions],
                 outputs=recipe_output
             )
         
