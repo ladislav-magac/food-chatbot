@@ -130,7 +130,7 @@ DB_DIR = str((Path.home() / "chroma_multimodal").resolve())
 if not os.path.isdir(DB_DIR):
     raise RuntimeError(
         f"Vector database directory not found: '{DB_DIR}'. "
-        "Please run build_index.py (Multimodal Vector Index Construction) first."
+        "Please run build_chromadb.py (Multimodal Vector Index Construction) first."
     )
 
 article_db = Chroma(collection_name="restaurant_articles", persist_directory=DB_DIR)
@@ -141,7 +141,7 @@ n_images   = image_db._collection.count()
 
 if n_articles <= 0 or n_images <= 0:
     raise RuntimeError(
-        "One or more collections are empty. Please rerun build_index.py to rebuild the index."
+        "One or more collections are empty. Please rerun build_chromadb.py to rebuild the index."
     )
 
 print(f"✅ Article vectors: {n_articles}")
