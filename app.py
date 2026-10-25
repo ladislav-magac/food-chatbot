@@ -4,9 +4,8 @@
 # ================================
 
 # Standard library
+import asyncio
 import json
-import os
-import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
@@ -14,16 +13,16 @@ from typing import List, Tuple, Dict, Any
 # Third-party
 import gradio as gr
 import numpy as np
-import torch
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
+# Libraries to create our MCP host application
+from fastmcp.client import Client, PythonStdioTransport
+from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from PIL import Image
-from sentence_transformers import SentenceTransformer
-from transformers import CLIPModel, CLIPProcessor
 
 print("✅ Environment ready")
+
+# Configuration
+SERVER_SCRIPT = str(Path(__file__).parent / "chromadb_mcp_server.py")
+SYSTEM_PROMPT = "You are a smart, useful agent with tools to access california restaurants and recipes." # TODO
 
 # Configure OpenAI API
 # os.environ["OPENAI_API_KEY"] = "your-api-key-here"
@@ -122,80 +121,6 @@ Respond with ONLY valid JSON."""
 print("Preference extraction function created!")
 
 # ================================
-# Verify vector database
-# ================================
-
-DB_DIR = str((Path.home() / "chroma_multimodal").resolve())
-
-if not os.path.isdir(DB_DIR):
-    raise RuntimeError(
-        f"Vector database directory not found: '{DB_DIR}'. "
-        "Please run build_chromadb.py (Multimodal Vector Index Construction) first."
-    )
-
-article_db = Chroma(collection_name="restaurant_articles", persist_directory=DB_DIR)
-image_db   = Chroma(collection_name="food_images",          persist_directory=DB_DIR)
-
-n_articles = article_db._collection.count()
-n_images   = image_db._collection.count()
-
-if n_articles <= 0 or n_images <= 0:
-    raise RuntimeError(
-        "One or more collections are empty. Please rerun build_chromadb.py to rebuild the index."
-    )
-
-print(f"✅ Article vectors: {n_articles}")
-print(f"✅ Image vectors:   {n_images}")
-
-# ================================
-# Initialize embedding models
-# ================================
-
-# ---- Text embedding model (384-d) ----
-text_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-def embed_texts(texts, batch_size=64):
-    return text_model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=False,
-        normalize_embeddings=True,  # cosine-ready
-    ).astype(np.float32)
-
-print("✅ Text embedder ready")
-
-
-# ---- CLIP embedding model (512-d) for image + query text ----
-device = "cpu"
-clip_name = "openai/clip-vit-base-patch32"
-clip_model = CLIPModel.from_pretrained(clip_name).to(device)
-clip_processor = CLIPProcessor.from_pretrained(clip_name, use_fast=True)
-clip_model.eval()
-
-@torch.no_grad()
-def embed_images(paths, batch_size=16):
-    vecs = []
-    for i in range(0, len(paths), batch_size):
-        batch = paths[i:i+batch_size]
-        imgs = [Image.open(p).convert("RGB") for p in batch]
-        inputs = clip_processor(images=imgs, return_tensors="pt").to(device)
-        feats = clip_model.get_image_features(**inputs)          # (B,512)
-        feats = feats.pooler_output
-        feats = feats / feats.norm(dim=-1, keepdim=True)         # cosine-ready
-        vecs.append(feats.cpu().numpy().astype(np.float32))
-    return np.vstack(vecs)
-
-@torch.no_grad()
-def embed_query_clip_text(query: str):
-    inputs = clip_processor(text=[query], return_tensors="pt", padding=True).to(device)
-    feats = clip_model.get_text_features(**inputs)              # (1,512)
-    feats = feats.pooler_output
-    feats = feats / feats.norm(dim=-1, keepdim=True)            # cosine-ready
-    return feats[0].cpu().numpy().astype(np.float32)
-
-print("✅ CLIP embedders ready")
-
-# ================================
 # Utilities
 # ================================
 
@@ -222,33 +147,78 @@ def _minmax(x):
         return np.ones_like(x)  # all equal -> treat as same confidence
     return (x - lo) / (hi - lo)
 
+# MCP Host — ReAct Agent Loop
+async def call_tool(query: str):
+    """Connect to the MCP server, discover tools, and run a ReAct loop.
+    The LLM decides which tools to call, calls them via the MCP server,
+    and repeats until it produces a final text response."""
+    transport = PythonStdioTransport(script_path=SERVER_SCRIPT)
+    
+    async with Client(transport) as client:
+        # Discover available tools from the MCP server
+        mcp_tools = await client.list_tools()
+    
+        # Convert MCP tool schemas to OpenAI-style tool definitions for the LLM
+        openai_tools = [
+                {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in mcp_tools
+        ]
+    
+        model = llm.bind_tools(openai_tools)
+    
+        # Build the message list from chat history and the new user message
+        messages = [SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=query)
+        ]
+
+        result = None
+    
+        # ReAct loop — call tools until the LLM returns a plain text reply
+        for _ in range(10):
+            response = model.invoke(messages)
+            messages.append(response)
+    
+            # No tool calls means the LLM is done — return the final response
+            if not response.tool_calls:
+                if result is not None and isinstance(result.data, dict):
+                    ids, docs, metas, dists = _unwrap(result.data)
+                    sims = _to_similarity(dists)
+                    return ids, docs, metas, sims
+                raw = response.content
+                if isinstance(raw, list):
+                    return " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in raw
+                    )
+                return str(raw)
+    
+            # Execute each tool call via the MCP server and feed results back
+            for tool_call in response.tool_calls:
+                result = await client.call_tool(tool_call["name"], tool_call["args"])
+                tool_output = " ".join(
+                    item.text if hasattr(item, "text") else str(item)
+                    for item in result.content
+                ) if result.content else "(no result)"
+                messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call["id"]))
+    
+        return "I wasn't able to complete that request. Please try again."
+
 # ================================
 # Retrieval functions
 # ================================
 
 def retrieve_articles(query: str, k: int = 5, where: dict | None = None):
-    q_vec = embed_texts([query])[0]  # 384-d
-    res = article_db._collection.query(
-        query_embeddings=[q_vec.tolist()],
-        n_results=k,
-        where=where,
-        include=["documents", "metadatas", "distances"],
-    )
-    ids, docs, metas, dists = _unwrap(res)
-    sims = _to_similarity(dists)
-    return ids, docs, metas, sims
+    return asyncio.run(call_tool(f"Retrieve {k} restaurants with query = {query} and where = {where}."))
 
 def retrieve_images_by_text(query: str, k: int = 5, where: dict | None = None):
-    q_vec = embed_query_clip_text(query)  # 512-d
-    res = image_db._collection.query(
-        query_embeddings=[q_vec.tolist()],
-        n_results=k,
-        where=where,
-        include=["documents", "metadatas", "distances"],
-    )
-    ids, docs, metas, dists = _unwrap(res)
-    sims = _to_similarity(dists)
-    return ids, docs, metas, sims
+    return asyncio.run(call_tool(f"Retrieve {k} recipes with query = {query} and where = {where}."))
 
 print("✅ Retrieval functions ready")
 
@@ -791,87 +761,13 @@ print("Complete chatbot function created!")
 def add_restaurant(name: str, cuisine: str, price: str, rating: float, location: str, description: str) -> str:
     """Add a new restaurant to the database."""
     print(f"Adding restaurant: {name}")
-    # ================================
-    # Build article document
-    # ================================
-
-    if not name:
-        return
-
-    name = name.strip()
-
-    text = (
-        f"Restaurant: {name}\n"
-        f"Cuisine: {cuisine}\n"
-        f"Location: {location}"
-    )
-
-    i = article_db._collection.count()
-
-    # GUARANTEED UNIQUE
-    doc_id = f"rest_{i}"
-
-    article_doc = Document(
-        page_content=text.strip(),
-        metadata={
-            "doc_id": doc_id,
-            "name": name,
-            "cuisine": cuisine,
-            "location": location,
-            "price_range": price,
-            "rating": rating,
-            "environment": description,
-            "source": "restaurant",
-        },
-    )
-
-    # ----- article DB -----
-    A = embed_texts([article_doc.page_content])
-
-    article_db._collection.upsert(
-        ids=[article_doc.metadata["doc_id"]],
-        embeddings=A.tolist(),
-        documents=[article_doc.page_content],
-        metadatas=[article_doc.metadata],
-    )
+    asyncio.run(call_tool(f"Add a new restaurant to the database with name = {name}, cuisine = {cuisine}, price = {price}, rating = {rating}, location = {location} and description = {description}."))
     return f"✅ Successfully added '{name}' to the database!"
 
 def add_recipe(name: str, cuisine: str, difficulty: str, servings: int, prep_time: str, cook_time: str, ingredients: str, src: str, instructions: str) -> str:
     """Add a new recipe to the database."""
     print(f"Adding recipe: {name}")
-    i = image_db._collection.count() + 1
-    image_path = str((Path.home() / "food-chatbot-data" / "recipe_images" / "added_recipe_images" / f"recipe{i}.png").resolve())
-    shutil.copy(src, image_path)
-
-    # -------- image --------
-    doc_id = f"img_{i}"
-    
-    image_doc = Document(
-        # keeps retrieval results readable
-        page_content=name,
-        metadata={
-            "doc_id": doc_id,
-            "image_path": image_path,
-            "source": "recipe_image",
-            "recipe_id": i,
-            "name": name,
-            "cuisine": cuisine,
-            "servings": servings,
-            "prep_time": prep_time,
-            "cook_time": cook_time,
-            "image_description": difficulty + " -> " + ingredients + " -> " + instructions,
-        },
-    )
-
-    # ----- image DB -----
-    V = embed_images([image_doc.metadata["image_path"]])
-
-    image_db._collection.upsert(
-        ids=[image_doc.metadata["doc_id"]],
-        embeddings=V.tolist(),
-        documents=[image_doc.page_content],
-        metadatas=[image_doc.metadata],
-    )
+    asyncio.run(call_tool(f"Add a new recipe to the database with name = {name}, cuisine = {cuisine}, difficulty = {difficulty}, servings = {servings}, prep_time = {prep_time}, cook_time = {cook_time}, ingredients = {ingredients}, src = {src} and instructions = {instructions}."))
 
     return f"✅ Successfully added '{name}' recipe to the database!"
 
