@@ -1,4 +1,4 @@
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from typing import Any, TypedDict, List, Dict
 from .user_profile_generator_agent import UserProfileGeneratorAgent
 from .candidates_retriever_agent import CandidatesRetrieverAgent
@@ -6,6 +6,7 @@ from .food_trend_analyst_agent import FoodTrendAnalystAgent
 from .food_style_expert_agent import FoodStyleExpertAgent
 from .nutrition_expert_agent import NutritionExpertAgent
 from .recommendation_expert_agent import RecommendationExpertAgent
+from .recommendation_evaluator_agent import RecommendationEvaluatorAgent
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ class AgentState(TypedDict):
     style_analysis: dict
     nutrition_analysis: dict
     final_recommendations: dict
+    made_up: str
 
 class AgentWorkflow:
     def __init__(self):
@@ -28,6 +30,7 @@ class AgentWorkflow:
         self.food_style_expert = FoodStyleExpertAgent()
         self.nutrition_expert = NutritionExpertAgent()
         self.recommendation_expert = RecommendationExpertAgent()
+        self.recommendation_evaluator = RecommendationEvaluatorAgent()
         self.compiled_workflow = self.build_workflow()  # Compile once during initialization
         
     def build_workflow(self):
@@ -41,6 +44,7 @@ class AgentWorkflow:
         workflow.add_node("analyze_food_styles", self._analyze_food_styles_step)
         workflow.add_node("analyze_nutrition", self._analyze_nutrition_step)
         workflow.add_node("generate_final_recommendation", self._generate_final_recommendation_step)
+        workflow.add_node("evaluate_final_recommendation", self._evaluate_final_recommendation_step)
         
         # Define edges
         workflow.set_entry_point("generate_user_profile")
@@ -51,6 +55,15 @@ class AgentWorkflow:
         workflow.add_edge("analyze_food_trends", "generate_final_recommendation")
         workflow.add_edge("analyze_food_styles", "generate_final_recommendation")
         workflow.add_edge("analyze_nutrition", "generate_final_recommendation")
+        workflow.add_edge("generate_final_recommendation", "evaluate_final_recommendation")
+        workflow.add_conditional_edges(
+            "evaluate_final_recommendation",
+            self._decide_next_step,
+            {
+                "re_generate_final_recommendation": "generate_final_recommendation",
+                "end": END
+            }
+        )
         return workflow.compile()
     
     def full_pipeline(self, preferences: Dict[str, Any]):
@@ -65,7 +78,8 @@ class AgentWorkflow:
                 trend_analysis={},
                 style_analysis={},
                 nutrition_analysis={},
-                final_recommendation={}
+                final_recommendations={},
+                made_up="NO"
             )
             
             final_state = self.compiled_workflow.invoke(initial_state)
@@ -112,3 +126,19 @@ class AgentWorkflow:
         result = self.recommendation_expert.generate_recommendation(state["user_profile"], state["retrieved_restaurants"], state["retrieved_recipes"], state["trend_analysis"], state["style_analysis"], state["nutrition_analysis"])
         print("[DEBUG] RecommendationExpertAgent synthesized all analyses into final recommendations.")
         return {"final_recommendations": result["final_recommendations"]}
+
+    def _evaluate_final_recommendation_step(self, state: AgentState) -> Dict:
+        print(f"[DEBUG] Entered _evaluate_final_recommendation_step with retrieved_restaurants='{state['retrieved_restaurants']}', retrieved_recipes='{state['retrieved_recipes']}' and final_recommendations='{state['final_recommendations']}'")
+        result = self.recommendation_evaluator.evaluate_recommendation(state["retrieved_restaurants"], state["retrieved_recipes"], state["final_recommendations"])
+        print("[DEBUG] RecommendationEvaluatorAgent evaluate final recommendations against the retrieved restaurants and recipes.")
+        return {"made_up": result}
+
+    def _decide_next_step(self, state: AgentState) -> str:
+        made_up = state["made_up"]
+        print(f"[DEBUG] _decide_next_step with made_up='{made_up}'")
+        if "YES" in made_up:
+            logger.info("[DEBUG] Evaluation indicates re-generate recommendation needed.")
+            return "re_generate_final_recommendation"
+        else:
+            logger.info("[DEBUG] Evaluation successful, ending workflow.")
+            return "end"
